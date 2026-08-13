@@ -1,4 +1,13 @@
+# Secrets & Output Data
 .env
 results.json
-docs/img/
 *.db
+
+# Dataset files & Generated Batches (Keep these out of Git)
+data/raw/
+data/batches/
+data/*.jsonl
+harness/data/
+
+# OS clutter
+.DS_Store

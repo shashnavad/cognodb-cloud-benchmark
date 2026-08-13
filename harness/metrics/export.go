@@ -1,3 +1,9 @@
-// STATUS: NOT IMPLEMENTED
-// Purpose: serialize all recorded metrics (ingest throughput, per-query
-// p50/p95, concurrency sweep QPS, RTT baseline per target) to results.json.
+package metrics
+
+import "context"
+
+// ExportResults is a stub that will write measurement results to disk.
+func ExportResults(ctx context.Context, path string, data any) error {
+	// Implementation to be added later.
+	return nil
+}

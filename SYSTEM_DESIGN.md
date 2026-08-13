@@ -2,7 +2,7 @@
 
 Given the 24-hour execution timeline and background in Go and Python, this design uses **Go** for high-precision, low-overhead concurrent load generation (p50/p95 latency tracking) and **Python** for dataset ETL, orchestration, and chart generation.
 
-**Revision note:** ArangoDB has been dropped in favor of **Kuzu**. ArangoDB uses AQL, a second query language, which would have required a separate query set and a separate HTTP adapter for one data point — disproportionate effort against a 1-day budget. Kuzu speaks Cypher like the other four targets, so the whole benchmark now runs on a single query language, and it needs only a thin adapter (no server/connection management, since it's embedded).
+**Revision note:** The original Kuzu plan has been replaced: Kuzu (embedded) was removed from the active target list and replaced with **ArcadeDB** (HTTP/SQL-style endpoint). ArcadeDB is accessed via an HTTP command API and is implemented as an adapter scaffold. This keeps the benchmark focused on server-based targets and simplifies fair comparisons. Kuzu's embedded path was removed to avoid mixing embedded-only benchmarks with server-based networked targets.
 
 ---
 
@@ -22,16 +22,20 @@ The system consists of five decoupled components: **Dataset Preparation**, **Tar
                            |  (Normalizer & Split)  |
                            +-----------+------------+
                                        |
-        +---------------+--------------+--------------+---------------+
-        |               |              |              |               |
-        v               v              v              v               v
- +-------------+  +-------------+  +-----------+  +-----------+  +-----------+
- |CognoDB Cloud|  |Neo4j AuraDB |  | Memgraph  |  | FalkorDB  |  |   Kuzu    |
- |(0.5 vCPU/   |  |(Free Tier)  |  |(0.5 vCPU/ |  |(0.5 vCPU/ |  |(embedded, |
- | 256MB RAM)  |  |             |  | 256MB RAM)|  | 256MB RAM)|  | no network|
- +------+------+  +------+------+  +-----+-----+  +-----+-----+  | hop)      |
-        |                |               |              |       +-----+-----+
-        +----------------+---------------+--------------+-------------+
+       +---------------+--------------+--------------+---------------+
+       |               |              |              |               |
+       v               v              v              v               
+    +-------------+  +-------------+  +-----------+  +-----------+
+    |CognoDB Cloud|  |Neo4j AuraDB |  | Memgraph  |  | FalkorDB  |
+    |(0.5 vCPU/   |  |(Free Tier)  |  |(0.5 vCPU/ |  |(0.5 vCPU/ |
+    | 256MB RAM)  |  |             |  | 256MB RAM)|  | 256MB RAM)|
+    +------+------+  +------+------+  +-----+-----+  +-----+-----+
+       |                |               |              |
+       v
+    +----------------+
+    |   ArcadeDB     |
+    | (HTTP / SQL)   |
+    +----------------+
                                        |
                                        v
                        +--------------------------------+
@@ -61,15 +65,15 @@ To ensure a fair evaluation (25% score weight) without resource advantages:
 | **Neo4j** | AuraDB Free | 0.5–1 vCPU, 1 GB RAM (throttled load) | Cypher | `neo4j-go-driver` (Bolt+s) |
 | **Memgraph** | Docker Container | Capped 0.5 vCPU, 256 MB RAM (`--memory=256m --cpus=0.5`) | Cypher | `neo4j-go-driver` (Bolt) |
 | **FalkorDB** | Docker Container | Capped 0.5 vCPU, 256 MB RAM | Cypher | `redis-go` (GRAPH.QUERY) |
-| **Kuzu** | Embedded (in-process) | N/A — no server, linked directly into the Go binary | Cypher | Kuzu Go/CGo binding |
+| **ArcadeDB** | HTTP command endpoint (SQL-like) | 0.5 vCPU, 256 MB RAM (capped when containerized) | SQL/Cypher-ish | HTTP `/command` adapter (ArcadeDB scaffold) |
 
-**CognoDB, Neo4j, and Memgraph share one adapter implementation** — all three speak Bolt/Cypher via `neo4j-go-driver`, differing only in connection URI and credentials. FalkorDB and Kuzu each need their own adapter, giving 3 adapters total across 5 targets instead of 5.
+**CognoDB, Neo4j, and Memgraph share one adapter implementation** — all three speak Bolt/Cypher via `neo4j-go-driver`, differing only in connection URI and credentials. FalkorDB and ArcadeDB each need their own adapter, giving 3 adapters total across the targets.
 
 ### Network & Fairness Mitigation (Crucial Methodology)
 
 1. **Baseline TCP Ping Subtraction**: CognoDB and AuraDB run in cloud regions while self-hosted containers run on localhost/cloud VMs, so raw network latency will distort database execution numbers. The Go engine runs a pre-benchmark RTT (Round Trip Time) TCP ping sweep (100 probes) to measure baseline connection latency and reports both **Total Roundtrip Latency** and **Estimated DB Server Execution Latency**.
 2. **Resource Capping**: For local/Docker-based graph databases, run under `--cpus=0.5 --memory=256m` to strictly enforce CognoDB free-tier limits.
-3. **Kuzu asymmetry — disclose, don't hide**: Kuzu is embedded, so it has no network hop and no independently capped process the way the other four do. This is not a fairness violation to paper over; it's a legitimate methodology point. Frame it explicitly in the README as a zero-network baseline that shows how much of the other four platforms' latency is network vs. execution time — the assignment's evaluation criteria explicitly reward disclosed caveats over hidden ones.
+3. **Network parity for server targets**: ArcadeDB and the containerized targets are exercised over HTTP/TCP, so they include a network hop similar to CognoDB and Neo4j. If ArcadeDB is tested locally in-container, enforce the same CPU/memory caps to preserve fair resource parity. Any remaining asymmetries must be documented in the README.
 
 ---
 
@@ -84,9 +88,9 @@ To ensure a fair evaluation (25% score weight) without resource advantages:
 
 ### Workload Matrix & Equivalent Queries
 
-All five targets now share a single Cypher query set — no AQL translation column needed.
+All targets now share a single Cypher/SQL-ish query set where possible — no AQL translation column needed.
 
-| Workload Category | Metric / Operation | Cypher Query (CognoDB, Neo4j, Memgraph, FalkorDB, Kuzu) |
+| Workload Category | Metric / Operation | Query (CognoDB, Neo4j, Memgraph, FalkorDB, ArcadeDB) |
 |---|---|---|
 | **Data Ingestion** | Bulk Node & Rel Creation | `UNWIND $batch AS row CREATE ...` |
 | **Lookups** | Point Lookup (Indexed) | `MATCH (u:User {id: $id}) RETURN u` |
@@ -105,7 +109,7 @@ The Go harness guarantees sub-millisecond timer resolution and lock-free thread 
 
 ### Core Go Components
 
-1. **`Config Engine`**: Reads environment variables (`COGNODB_URI`, `NEO4J_URI`, `KUZU_DB_PATH`, etc.) — zero hardcoded credentials.
+1. **`Config Engine`**: Reads environment variables (`COGNODB_URI`, `NEO4J_URI`, `ARCADEDB_URL`, etc.) — zero hardcoded credentials.
 2. **`Adapter Interface`**:
    ```go
    type GraphDBAdapter interface {
@@ -118,7 +122,7 @@ The Go harness guarantees sub-millisecond timer resolution and lock-free thread 
        Close() error
    }
    ```
-   Three concrete implementations: `bolt_adapter.go` (CognoDB, Neo4j, Memgraph), `falkordb_adapter.go`, `kuzu_adapter.go`.
+   Three concrete implementations: `bolt_adapter.go` (CognoDB, Neo4j, Memgraph), `falkordb_adapter.go`, `arcadedb_adapter.go`.
 3. **`Warmup & Runner Loop`**:
    - **Cold Start**: Executes 1 query iteration immediately post-ingestion; records latency.
    - **Warm-up Phase**: Runs 20 unmeasured query iterations to populate buffer caches/memory.
@@ -126,7 +130,6 @@ The Go harness guarantees sub-millisecond timer resolution and lock-free thread 
 4. **`Concurrency Engine (Worker Pool)`**:
    - Sweeps across 1, 10, and 40 concurrent workers (goroutines) for 60 seconds per test.
    - Tracks throughput (QPS) and latency distributions (p50, p95) using `HdrHistogram`.
-   - Kuzu is single-process/embedded — concurrent access is in-process goroutines against the same handle rather than concurrent network clients; note this distinction in the mixed-workload results.
 
 ---
 
@@ -146,7 +149,7 @@ cognodb-cloud-benchmark/
 │   ├── go.mod
 │   ├── main.go                 # CLI Orchestrator
 │   ├── config/                 # Env & Flags
-│   ├── adapters/               # bolt_adapter, falkordb_adapter, kuzu_adapter
+│   ├── adapters/               # bolt_adapter, falkordb_adapter, arcadedb_adapter
 │   └── metrics/                # HdrHistogram latency tracking & JSON exporter
 ├── scripts/
 │   ├── plot_results.py         # Generates charts for README
@@ -155,7 +158,7 @@ cognodb-cloud-benchmark/
     └── BENCHMARK_ARTICLE.md    # Engaging technical evangelism blog post
 ```
 
-Note: `docker-compose.yml` now only needs Memgraph and FalkorDB services. CognoDB and Neo4j AuraDB are cloud-hosted; Kuzu is embedded — neither needs a container.
+Note: `docker-compose.yml` now only needs Memgraph and FalkorDB services; ArcadeDB can be added as an optional local HTTP service for testing. CognoDB and Neo4j AuraDB are cloud-hosted.
 
 ### Automation Sequence (`make run-all`)
 
@@ -181,14 +184,27 @@ The assessment allocates 40% total weight to README & Analysis (15%) and Communi
 - **Title idea**: *Benchmarking CognoDB Cloud: How a Burstable 256MB Instance Handles Graph Workloads*
 - **Core narrative**:
   1. **The Challenge**: How do modern graph cloud engines perform when constrained to entry/free tiers (256 MB RAM, 0.5 vCPU)?
-  2. **Fairness First**: Methodology — normalizing network latency, keeping a single query language across all five targets, keeping specs strictly identical, and disclosing the one target (Kuzu) that structurally can't match the others' network profile.
-  3. **The Data Speaks**: p50/p95 latency charts, highlighting where CognoDB excels and where the embedded baseline (Kuzu) shows how much of the other platforms' latency is pure network overhead.
-  4. **Honest Caveats**: cloud free-tier CPU bursting limits, network variance, memory limits during deep 3-hop traversals, and the Kuzu embedded-vs-networked asymmetry.
+   2. **Fairness First**: Methodology — normalizing network latency, keeping a single query language across all targets, keeping specs strictly identical, and documenting any structural asymmetries.
+   3. **The Data Speaks**: p50/p95 latency charts, highlighting where CognoDB excels and how network vs. execution time contribute across cloud and local targets.
+   4. **Honest Caveats**: cloud free-tier CPU bursting limits, network variance, memory limits during deep 3-hop traversals, and any adapter-specific asymmetries — document them per-target.
 
 ---
 
-## Next Steps
+## Current Status
 
-1. `harness/adapters/adapter.go` — the `GraphDBAdapter` interface everything else depends on.
-2. `data/download_snap.py` — dataset ready before writing Go code against it.
-3. `harness/adapters/bolt_adapter.go` — one implementation, three targets (CognoDB, Neo4j, Memgraph).
+- Implemented: `GraphDBAdapter` interface and `bolt_adapter.go` (CognoDB, Neo4j, Memgraph).
+- Implemented: Python ETL `data/download_snap.py` (batched JSON payloads + `dataset_stats.json`).
+- Implemented: ingestion runner, warmup/measurement loop, and concurrency sweep in the Go harness; `go build ./...` succeeds in `harness/`.
+- Scaffolded: `falkordb_adapter.go` (RedisGraph) and `arcadedb_adapter.go` (HTTP `/command`) — functional scaffolds that need hardening and validation.
+- Changed write workload behavior to append relationships between existing nodes to avoid dataset growth during concurrent writes.
+
+## Upcoming Steps (actionable)
+
+1. Harden FalkorDB ingestion and batching (in-progress): implement chunked payloads, proper escaping, or temporary-key parameterization to avoid inline command-size limits and injection.
+2. Validate and tune ArcadeDB adapter against a running ArcadeDB instance: confirm endpoint, auth, SQL dialect, and robust error handling.
+3. Add per-adapter `prepare` steps: create indexes (e.g., index on `User.id`) before ingestion to ensure comparable query performance.
+4. Replace in-memory histogram with `HdrHistogram` for accurate p50/p95/p99 under high concurrency.
+5. Add plotting/report automation and a `make run-all` flow that runs ETL, boots containers, runs harness, and generates the report and charts.
+6. Document run recipes, example `env` files, and required credentials in `README.md`.
+
+If you want I'll start by hardening the FalkorDB ingestion (step 1) and then validate ArcadeDB (step 2). Which should I run first?
