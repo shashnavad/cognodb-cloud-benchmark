@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -14,11 +15,23 @@ import (
 )
 
 func main() {
+	// 1. Declare ALL CLI flags at the start
 	configPath := flag.String("config", "", "path to JSON config (not required for this minimal scaffold)")
+	ingestFlag := flag.Bool("ingest", false, "run ingestion from data/batches")
+	measureFlag := flag.Bool("measure", false, "run measurement workloads")
+	batchesDir := flag.String("batches-dir", "../data/batches", "path to batches directory")
+	nodesFile := flag.String("nodes-file", "../data/nodes.jsonl", "path to nodes.jsonl for sampling")
+	iterations := flag.Int("iterations", 100, "number of measured iterations per query")
+	concurrencyFlag := flag.Bool("concurrency", false, "run concurrency sweep")
+	concurrencyClients := flag.String("concurrency-clients", "1,10,40", "comma-separated client counts for sweep")
+	concurrencyDuration := flag.Int("concurrency-duration", 60, "seconds per concurrency sweep")
+	concurrencyRead := flag.Int("concurrency-read", 80, "percent reads in mixed workload (0-100)")
+
+	// 2. Parse flags ONCE
 	flag.Parse()
 	_ = configPath
 
-	// Read connection info from environment variables. Do NOT hardcode secrets.
+	// 3. Read environment variables
 	uri := os.Getenv("NEO4J_URI")
 	user := os.Getenv("NEO4J_USER")
 	pass := os.Getenv("NEO4J_PASS")
@@ -38,18 +51,7 @@ func main() {
 
 	fmt.Println("Connected to Neo4j-compatible endpoint.")
 
-	// Option flags control ingest and measurement flows
-	ingestFlag := flag.Bool("ingest", false, "run ingestion from data/batches")
-	measureFlag := flag.Bool("measure", false, "run measurement workloads")
-	batchesDir := flag.String("batches-dir", "../data/batches", "path to batches directory")
-	nodesFile := flag.String("nodes-file", "../data/nodes.jsonl", "path to nodes.jsonl for sampling")
-	iterations := flag.Int("iterations", 100, "number of measured iterations per query")
-	concurrencyFlag := flag.Bool("concurrency", false, "run concurrency sweep")
-	concurrencyClients := flag.String("concurrency-clients", "1,10,40", "comma-separated client counts for sweep")
-	concurrencyDuration := flag.Int("concurrency-duration", 60, "seconds per concurrency sweep")
-	concurrencyRead := flag.Int("concurrency-read", 80, "percent reads in mixed workload (0-100)")
-	flag.Parse()
-
+	// 4. Ingestion execution flow
 	if *ingestFlag {
 		fmt.Println("Starting ingestion from", *batchesDir)
 		n, r, err := RunIngest(ctx, adapter, *batchesDir)
@@ -57,14 +59,16 @@ func main() {
 			log.Fatalf("ingest failed: %v", err)
 		}
 		fmt.Printf("Ingested nodes=%d rels=%d\n", n, r)
-		// exit after ingest when requested
-		return
 	}
 
+	// 5. Measurement execution flow
 	if *measureFlag {
 		fmt.Println("Running measurement workloads (iterations=", *iterations, ")")
-		// Run a set of canonical queries and print p50/p95
 		queryTypes := []string{"point", "traversal_1", "traversal_2", "traversal_3", "aggregation"}
+
+		// Map to capture benchmark results for plotting
+		results := make(map[string]map[string]int64)
+
 		for _, q := range queryTypes {
 			fmt.Printf("Measuring %s...\n", q)
 			res, err := workload.RunMeasurementLoop(ctx, adapter, *nodesFile, q, *iterations)
@@ -73,9 +77,23 @@ func main() {
 				continue
 			}
 			fmt.Printf("  %s p50=%dµs p95=%dµs\n", q, res.P50, res.P95)
+
+			results[q] = map[string]int64{
+				"p50_us": res.P50,
+				"p95_us": res.P95,
+			}
 		}
+
+		// Save output to ../results/results.json
+		if err := os.MkdirAll("../results", 0755); err == nil {
+			if data, err := json.MarshalIndent(results, "", "  "); err == nil {
+				if err := os.WriteFile("../results/results.json", data, 0644); err == nil {
+					fmt.Println("Saved benchmark output to ../results/results.json")
+				}
+			}
+		}
+
 		if *concurrencyFlag {
-			// parse clients
 			parts := strings.Split(*concurrencyClients, ",")
 			ids, err := workload.LoadNodeIDs(*nodesFile)
 			if err != nil {

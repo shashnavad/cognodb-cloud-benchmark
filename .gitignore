@@ -11,3 +11,6 @@ harness/data/
 
 # OS clutter
 .DS_Store
+echo "Neo4j-Created-*.txt" >> .gitignore
+echo "harness/bin/" >> .gitignore
+git add .gitignore

@@ -1,3 +1,68 @@
-# STATUS: NOT IMPLEMENTED
-# Services needed: memgraph, falkordb — both capped --cpus=0.5 --memory=256m
-# Kuzu is embedded (no container). CognoDB and Neo4j AuraDB are cloud-hosted (no container).
+services:
+  memgraph:
+    image: memgraph/memgraph:latest
+    container_name: memgraph
+    ports:
+      - "7687:7687" # Bolt
+      - "3000:3000" # HTTP (Memgraph Lab)
+    restart: unless-stopped
+    volumes:
+      - memgraph_data:/var/lib/memgraph
+    mem_limit: 256m
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sS http://localhost:3000/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: falkordb
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+    volumes:
+      - redisgraph_data:/data
+    mem_limit: 256m
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  arcadedb:
+    image: arcadedata/arcadedb:latest
+    container_name: arcadedb
+    ports:
+      - "2480:2480" # HTTP
+    restart: unless-stopped
+    volumes:
+      - arcadedb_data:/opt/arcadedb/databases
+    mem_limit: 256m
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    environment:
+      - ARCADEDB_ROOT_PASSWORD=admin
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sS http://localhost:2480/ || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  memgraph_data:
+  redisgraph_data:
+  arcadedb_data:

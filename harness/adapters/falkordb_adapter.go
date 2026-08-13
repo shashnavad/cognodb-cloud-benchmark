@@ -48,19 +48,19 @@ func (f *FalkorDBAdapter) ExecuteWrite(ctx context.Context, cypher string, param
 	// so inline simple params by replacing $param with quoted values when present.
 	q := cypher
 	for k, v := range params {
-		q = strings.ReplaceAll(q, "$"+k, fmt.Sprintf("'%v'", v))
+		q = strings.ReplaceAll(q, "$"+k, fmt.Sprintf("'%v'", escapeString(fmt.Sprintf("%v", v))))
 	}
 	// GRAPH.QUERY <graph> <query>
 	return f.client.Do(ctx, "GRAPH.QUERY", f.graph, q).Err()
 }
 
 func (f *FalkorDBAdapter) PointLookup(ctx context.Context, id string) error {
-	q := fmt.Sprintf("MATCH (u:User {id:'%s'}) RETURN u LIMIT 1", id)
+	q := fmt.Sprintf("MATCH (u:User {id:'%s'}) RETURN u LIMIT 1", escapeString(id))
 	return f.client.Do(ctx, "GRAPH.QUERY", f.graph, q).Err()
 }
 
 func (f *FalkorDBAdapter) Traversal(ctx context.Context, startID string, hops int) error {
-	q := fmt.Sprintf("MATCH (u:User {id:'%s'})-[:MUTUAL_FOLLOW*%d]->(m) RETURN count(DISTINCT m)", startID, hops)
+	q := fmt.Sprintf("MATCH (u:User {id:'%s'})-[:MUTUAL_FOLLOW*%d]->(m) RETURN count(DISTINCT m)", escapeString(startID), hops)
 	return f.client.Do(ctx, "GRAPH.QUERY", f.graph, q).Err()
 }
 
@@ -70,27 +70,59 @@ func (f *FalkorDBAdapter) Aggregation(ctx context.Context) error {
 }
 
 func (f *FalkorDBAdapter) IngestBatch(ctx context.Context, nodes []Node, rels []Relationship) error {
+	// Ingest nodes in chunks to avoid oversized inline commands and to escape values safely.
+	const chunkSize = 200
 	// Ingest nodes
-	if len(nodes) > 0 {
-		// Build UNWIND-style list inline
+	for i := 0; i < len(nodes); i += chunkSize {
+		end := i + chunkSize
+		if end > len(nodes) {
+			end = len(nodes)
+		}
+		batch := nodes[i:end]
 		var parts []string
-		for _, n := range nodes {
-			parts = append(parts, fmt.Sprintf("{id:'%s', location:'%s', public_repos:%d}", n.ID, n.Location, n.PublicRepos))
+		for _, n := range batch {
+			parts = append(parts, fmt.Sprintf("{id:'%s', location:'%s', public_repos:%d}", escapeString(n.ID), escapeString(n.Location), n.PublicRepos))
 		}
 		q := fmt.Sprintf("UNWIND [%s] AS row MERGE (u:User {id: row.id}) SET u.location = row.location, u.public_repos = row.public_repos", strings.Join(parts, ","))
-		if err := f.client.Do(ctx, "GRAPH.QUERY", f.graph, q).Err(); err != nil {
-			return err
+		// use pipeline to avoid round trips
+		_, err := f.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Do(ctx, "GRAPH.QUERY", f.graph, q)
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("falkordb ingest nodes chunk err: %w", err)
 		}
 	}
-	if len(rels) > 0 {
+
+	// Ingest relationships in chunks
+	for i := 0; i < len(rels); i += chunkSize {
+		end := i + chunkSize
+		if end > len(rels) {
+			end = len(rels)
+		}
+		batch := rels[i:end]
 		var parts []string
-		for _, r := range rels {
-			parts = append(parts, fmt.Sprintf("{from:'%s', to:'%s'}", r.From, r.To))
+		for _, r := range batch {
+			parts = append(parts, fmt.Sprintf("{from:'%s', to:'%s'}", escapeString(r.From), escapeString(r.To)))
 		}
 		q := fmt.Sprintf("UNWIND [%s] AS r MATCH (a:User {id: r.from}), (b:User {id: r.to}) MERGE (a)-[:MUTUAL_FOLLOW]->(b)", strings.Join(parts, ","))
-		if err := f.client.Do(ctx, "GRAPH.QUERY", f.graph, q).Err(); err != nil {
-			return err
+		_, err := f.client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Do(ctx, "GRAPH.QUERY", f.graph, q)
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("falkordb ingest rels chunk err: %w", err)
 		}
 	}
 	return nil
+}
+
+// escapeString makes single quotes safe for inline Cypher strings by escaping single quotes and backslashes.
+func escapeString(s string) string {
+	if s == "" {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "'", "\\'")
+	return s
 }

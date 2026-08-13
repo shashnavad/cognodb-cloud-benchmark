@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"cognodb-cloud-benchmark/harness/adapters"
 )
@@ -26,10 +27,12 @@ func RunIngest(ctx context.Context, adapter adapters.GraphDBAdapter, batchesDir 
 		if d.IsDir() {
 			return nil
 		}
+		// Replace lines 28–33 with strings.HasPrefix:
+		base := filepath.Base(path)
 		switch {
-		case filepath.Base(path)[:11] == "nodes_batch_":
+		case strings.HasPrefix(base, "nodes_batch_"):
 			nodeFiles = append(nodeFiles, path)
-		case filepath.Base(path)[:10] == "rels_batch_":
+		case strings.HasPrefix(base, "rels_batch_"):
 			relFiles = append(relFiles, path)
 		}
 		return nil
@@ -44,7 +47,9 @@ func RunIngest(ctx context.Context, adapter adapters.GraphDBAdapter, batchesDir 
 	totalRels := 0
 
 	// Ingest nodes batches
-	for _, f := range nodeFiles {
+	fmt.Printf("Ingesting %d node batches...\n", len(nodeFiles))
+	for i, f := range nodeFiles {
+		fmt.Printf("  [Node Batch %d/%d] %s\n", i+1, len(nodeFiles), filepath.Base(f))
 		data, err := os.ReadFile(f)
 		if err != nil {
 			return totalNodes, totalRels, err
@@ -60,7 +65,9 @@ func RunIngest(ctx context.Context, adapter adapters.GraphDBAdapter, batchesDir 
 	}
 
 	// Ingest relationship batches
-	for _, f := range relFiles {
+	fmt.Printf("Ingesting %d relationship batches...\n", len(relFiles))
+	for i, f := range relFiles {
+		fmt.Printf("  [Rel Batch %d/%d] %s\n", i+1, len(relFiles), filepath.Base(f))
 		data, err := os.ReadFile(f)
 		if err != nil {
 			return totalNodes, totalRels, err

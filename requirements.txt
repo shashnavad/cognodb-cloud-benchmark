@@ -1,2 +1,9 @@
 requests>=2.30.0
 tqdm>=4.0.0
+# Optional but recommended for ArcadeDB/HTTP interactions
+httpx>=0.24.0
+# For plotting scripts
+matplotlib>=3.6.0
+seaborn>=0.12.0
+# For report generation
+markdown>=3.4.0

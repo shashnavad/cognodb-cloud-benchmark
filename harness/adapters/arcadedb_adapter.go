@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type ArcadeDBAdapter struct {
@@ -23,13 +25,16 @@ func (a *ArcadeDBAdapter) Connect(ctx context.Context, uri, user, pass string) e
 	if user != "" && pass != "" {
 		a.auth = user + ":" + pass
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, a.baseURL, nil)
+	// Try a simple GET to the base URL with a short timeout to validate connectivity.
+	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(pingCtx, http.MethodGet, a.baseURL, nil)
 	resp, err := a.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("arcadedb ping: %w", err)
 	}
+	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("arcadedb ping: status %d", resp.StatusCode)
 	}
@@ -50,36 +55,62 @@ func (a *ArcadeDBAdapter) doQuery(ctx context.Context, path string, payload any)
 	if err != nil {
 		return err
 	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
+	defer resp.Body.Close()
+	body, _ := ioutil.ReadAll(resp.Body)
 	if resp.StatusCode >= 400 {
-		return fmt.Errorf("arcadedb query: status %d", resp.StatusCode)
+		return fmt.Errorf("arcadedb query: status %d body=%s", resp.StatusCode, string(body))
 	}
 	return nil
 }
 
 func (a *ArcadeDBAdapter) IngestBatch(ctx context.Context, nodes []Node, rels []Relationship) error {
+	// Chunk ingestion to avoid large command payloads.
+	const chunkSize = 200
 	if len(nodes) > 0 {
-		var cmds []string
-		for _, n := range nodes {
-			cmds = append(cmds, fmt.Sprintf("CREATE VERTEX User SET id = '%s', location = '%s', public_repos = %d", n.ID, n.Location, n.PublicRepos))
-		}
-		payload := map[string]any{"language": "sql", "command": strings.Join(cmds, ";")}
-		if err := a.doQuery(ctx, "/command", payload); err != nil {
-			return err
+		for i := 0; i < len(nodes); i += chunkSize {
+			end := i + chunkSize
+			if end > len(nodes) {
+				end = len(nodes)
+			}
+			batch := nodes[i:end]
+			var cmds []string
+			for _, n := range batch {
+				cmds = append(cmds, fmt.Sprintf("CREATE VERTEX User SET id = '%s', location = '%s', public_repos = %d", escapeSQL(n.ID), escapeSQL(n.Location), n.PublicRepos))
+			}
+			payload := map[string]any{"language": "sql", "command": strings.Join(cmds, ";")}
+			if err := a.doQuery(ctx, "/command", payload); err != nil {
+				return fmt.Errorf("arcade ingest nodes chunk: %w", err)
+			}
 		}
 	}
 	if len(rels) > 0 {
-		var cmds []string
-		for _, r := range rels {
-			cmds = append(cmds, fmt.Sprintf("CREATE EDGE MUTUAL_FOLLOW FROM (SELECT FROM User WHERE id = '%s') TO (SELECT FROM User WHERE id = '%s')", r.From, r.To))
-		}
-		payload := map[string]any{"language": "sql", "command": strings.Join(cmds, ";")}
-		if err := a.doQuery(ctx, "/command", payload); err != nil {
-			return err
+		for i := 0; i < len(rels); i += chunkSize {
+			end := i + chunkSize
+			if end > len(rels) {
+				end = len(rels)
+			}
+			batch := rels[i:end]
+			var cmds []string
+			for _, r := range batch {
+				cmds = append(cmds, fmt.Sprintf("CREATE EDGE MUTUAL_FOLLOW FROM (SELECT FROM User WHERE id = '%s') TO (SELECT FROM User WHERE id = '%s')", escapeSQL(r.From), escapeSQL(r.To)))
+			}
+			payload := map[string]any{"language": "sql", "command": strings.Join(cmds, ";")}
+			if err := a.doQuery(ctx, "/command", payload); err != nil {
+				return fmt.Errorf("arcade ingest rels chunk: %w", err)
+			}
 		}
 	}
 	return nil
+}
+
+// escapeSQL performs minimal escaping for single quotes and backslashes in SQL-style commands.
+func escapeSQL(s string) string {
+	if s == "" {
+		return s
+	}
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "'", "\\'")
+	return s
 }
 
 func (a *ArcadeDBAdapter) PointLookup(ctx context.Context, id string) error {
