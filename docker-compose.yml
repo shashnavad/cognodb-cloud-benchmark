@@ -1,0 +1,3 @@
+# STATUS: NOT IMPLEMENTED
+# Services needed: memgraph, falkordb — both capped --cpus=0.5 --memory=256m
+# Kuzu is embedded (no container). CognoDB and Neo4j AuraDB are cloud-hosted (no container).

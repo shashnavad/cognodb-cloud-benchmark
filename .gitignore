@@ -1,0 +1,4 @@
+.env
+results.json
+docs/img/
+*.db
