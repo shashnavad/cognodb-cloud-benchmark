@@ -1,163 +1,91 @@
-from __future__ import annotations
-
 import argparse
-import csv
-import gzip
 import json
 import os
-import hashlib
-from pathlib import Path
-from typing import Iterable, Tuple
+import io
+import zipfile
+import requests
 
-try:
-    import requests
-except Exception:
-    requests = None
+DEFAULT_SNAP_URL = "https://snap.stanford.edu/data/git_web_ml.zip"
+RAW_DIR = "data/raw"
+BATCH_DIR = "data/batches"
+NODES_FILE = "data/nodes.jsonl"
 
-DEFAULT_SNAP_URL = "https://snap.stanford.edu/data/musae_git_edges.csv.gz"
-def ensure_dir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+def download_and_extract_snap(url, output_dir):
+    os.makedirs(output_dir, exist_ok=True)
+    target_csv = os.path.join(output_dir, "musae_git_edges.csv")
+    
+    if os.path.exists(target_csv):
+        print(f"Dataset already exists at {target_csv}, skipping download.")
+        return target_csv
 
-def open_maybe_gz(path: Path):
-    if str(path).endswith(".gz"):
-        return gzip.open(path, "rt", encoding="utf-8")
-    return open(path, "r", encoding="utf-8")
+    print(f"Downloading dataset from {url}...")
+    r = requests.get(url, stream=True)
+    r.raise_for_status()
 
-def download_file(url: str, out: Path, chunk_size: int = 8192) -> None:
-    if requests is None:
-        raise RuntimeError("requests is required to download files. Install with `pip install requests`.")
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        with open(out, "wb") as f:
-            for chunk in r.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    f.write(chunk)
+    print("Extracting zip archive...")
+    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+        for file_info in z.infolist():
+            if file_info.filename.endswith("musae_git_edges.csv"):
+                file_info.filename = "musae_git_edges.csv"
+                z.extract(file_info, output_dir)
+                print(f"Extracted -> {target_csv}")
+                return target_csv
 
-def detect_delimiter(sample: str) -> str:
-    try:
-        dialect = csv.Sniffer().sniff(sample)
-        return dialect.delimiter
-    except Exception:
-        return ","
+    raise FileNotFoundError("musae_git_edges.csv not found inside zip archive")
 
-def parse_edge_lines(lines: Iterable[str]) -> Iterable[Tuple[str, str]]:
-    buf = []
-    for i, ln in enumerate(lines):
-        if i < 20:
-            buf.append(ln)
-        if ln.strip() == "" or ln.lstrip().startswith("#"):
-            continue
-    sample = "\n".join(buf)
-    delim = detect_delimiter(sample)
-    reader = csv.reader(lines, delimiter=delim)
-    for row in reader:
-        if not row or len(row) < 2:
-            continue
-        if row[0].startswith("#"):
-            continue
-        # Skip header rows
-        if row[0].lower() in ("id_1", "src", "source", "from", "node_1", "u1", "node1"):
-            continue
-        yield row[0].strip(), row[1].strip()
+def prepare_batches(csv_path, batch_size=5000):
+    os.makedirs(BATCH_DIR, exist_ok=True)
+    os.makedirs(os.path.dirname(NODES_FILE), exist_ok=True)
 
-def synth_node_attrs(node_id: str) -> dict:
-    h = hashlib.sha256(node_id.encode("utf-8")).digest()
-    public_repos = h[0] % 100
-    return {"id": node_id, "location": "", "public_repos": int(public_repos)}
-
-def write_jsonl(path: Path, objs: Iterable[dict]) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        for o in objs:
-            f.write(json.dumps(o, separators=(",", ":")) + "\n")
-
-def chunked_iterable(iterable, size):
-    buf = []
-    for it in iterable:
-        buf.append(it)
-        if len(buf) >= size:
-            yield buf
-            buf = []
-    if buf:
-        yield buf
-
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--source-url", default=DEFAULT_SNAP_URL, help="URL to download the edge list")
-    p.add_argument("--source-path", help="Local path to an edge list file (optional)")
-    p.add_argument("--out-dir", default="data", help="Output directory")
-    p.add_argument("--batch-size", type=int, default=5000, help="Batch size for nodes/relationships")
-    p.add_argument("--force", action="store_true", help="Overwrite existing outputs if present")
-    args = p.parse_args()
-
-    out_dir = Path(args.out_dir)
-    raw_dir = out_dir / "raw"
-    batches_dir = out_dir / "batches"
-    ensure_dir(out_dir)
-    ensure_dir(raw_dir)
-    ensure_dir(batches_dir)
-
-    # Determine source path
-    if args.source_path:
-        source_path = Path(args.source_path)
-        if not source_path.exists():
-            raise SystemExit(f"source path not found: {source_path}")
-    else:
-        fname = Path(args.source_url.split("/")[-1])
-        if not fname.suffix:
-            fname = fname.with_suffix('.csv')
-        dest = raw_dir / fname
-        if dest.exists() and not args.force:
-            print(f"Using cached raw dataset {dest}")
-        else:
-            print(f"Downloading {args.source_url} -> {dest}")
-            download_file(args.source_url, dest)
-        source_path = dest
-
-    # Parse edges and build node set
-    print(f"Parsing edges from {source_path}")
+    nodes = set()
     edges = []
-    nodes_set = set()
-    with open_maybe_gz(source_path) as fh:
-        lines = [l for l in fh]
-    for src, dst in parse_edge_lines(lines):
-        edges.append({"from": src, "to": dst, "type": "MUTUAL_FOLLOW"})
-        nodes_set.add(src)
-        nodes_set.add(dst)
 
-    print(f"Found {len(nodes_set)} unique nodes and {len(edges)} relationships")
+    print(f"Parsing edges from {csv_path}...")
+    with open(csv_path, "r") as f:
+        _ = f.readline()  # Skip header
+        for line in f:
+            parts = line.strip().split(",")
+            if len(parts) >= 2:
+                u, v = parts[0].strip(), parts[1].strip()
+                nodes.add(u)
+                nodes.add(v)
+                edges.append((u, v))
 
-    # Synthesize nodes
-    nodes = [synth_node_attrs(n) for n in sorted(nodes_set)]
+    print(f"Total Nodes: {len(nodes)}, Total Edges: {len(edges)}")
 
-    # Write full JSONL outputs
-    nodes_jsonl = out_dir / "nodes.jsonl"
-    rels_jsonl = out_dir / "relationships.jsonl"
-    if not nodes_jsonl.exists() or args.force:
-        write_jsonl(nodes_jsonl, nodes)
-    if not rels_jsonl.exists() or args.force:
-        write_jsonl(rels_jsonl, edges)
+    # Write nodes.jsonl for query sampling
+    with open(NODES_FILE, "w") as f:
+        for node_id in nodes:
+            f.write(json.dumps({"id": node_id}) + "\n")
 
-    # Clean out stale batches before writing new ones
-    for old_batch in batches_dir.glob("*.json"):
-        old_batch.unlink()
+    # Generate node batches as raw arrays
+    node_list = list(nodes)
+    node_batch_idx = 0
+    for i in range(0, len(node_list), batch_size):
+        batch = [{"id": nid, "label": "User"} for nid in node_list[i:i + batch_size]]
+        batch_path = os.path.join(BATCH_DIR, f"nodes_batch_{node_batch_idx:03d}.json")
+        with open(batch_path, "w") as f:
+            json.dump(batch, f)  # Raw array output
+        node_batch_idx += 1
 
-    # Create new batches
-    batch_size = int(args.batch_size)
-    for i, chunk in enumerate(chunked_iterable(nodes, batch_size), start=1):
-        outp = batches_dir / f"nodes_batch_{i:04d}.json"
-        with open(outp, "w", encoding="utf-8") as f:
-            json.dump(chunk, f, separators=(",", ":"))
+    # Generate edge batches as raw arrays
+    rel_batch_idx = 0
+    for i in range(0, len(edges), batch_size):
+        batch = [{"from": u, "to": v, "type": "MUTUAL_FOLLOW"} for u, v in edges[i:i + batch_size]]
+        batch_path = os.path.join(BATCH_DIR, f"rels_batch_{rel_batch_idx:03d}.json")
+        with open(batch_path, "w") as f:
+            json.dump(batch, f)  # Raw array output
+        rel_batch_idx += 1
 
-    for i, chunk in enumerate(chunked_iterable(edges, batch_size), start=1):
-        outp = batches_dir / f"rels_batch_{i:04d}.json"
-        with open(outp, "w", encoding="utf-8") as f:
-            json.dump(chunk, f, separators=(",", ":"))
+    print(f"Saved {node_batch_idx} node batches and {rel_batch_idx} relationship batches into {BATCH_DIR}")
 
-    stats = {"nodes": len(nodes), "relationships": len(edges)}
-    with open(out_dir / "dataset_stats.json", "w", encoding="utf-8") as f:
-        json.dump(stats, f, indent=2)
+def main():
+    parser = argparse.ArgumentParser(description="Download & prepare SNAP dataset")
+    parser.add_argument("--source-url", default=DEFAULT_SNAP_URL, help="SNAP dataset URL")
+    args = parser.parse_args()
 
-    print(f"Wrote {i} batches to {batches_dir}; stats: {stats}")
+    csv_path = download_and_extract_snap(args.source_url, RAW_DIR)
+    prepare_batches(csv_path)
 
 if __name__ == "__main__":
     main()

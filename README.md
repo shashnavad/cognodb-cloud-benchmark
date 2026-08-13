@@ -75,13 +75,13 @@ chmod +x scripts/run_all.sh
 ## 📈 Benchmark Results Matrix
 
 <!-- BENCHMARK_RESULTS_START -->
-| Workload | p50 Latency (ms) | p95 Latency (ms) | p50 (µs) | p95 (µs) |
-| :--- | :--- | :--- | :--- | :--- |
-| `aggregation` | **242.98 ms** | **292.66 ms** | 242,978 µs | 292,662 µs |
-| `point` | **182.88 ms** | **211.40 ms** | 182,885 µs | 211,396 µs |
-| `traversal_1` | **185.14 ms** | **212.55 ms** | 185,140 µs | 212,551 µs |
-| `traversal_2` | **184.45 ms** | **216.05 ms** | 184,447 µs | 216,046 µs |
-| `traversal_3` | **182.97 ms** | **214.01 ms** | 182,971 µs | 214,006 µs |
+| Workload | ARCADEDB p50 (ms) | COGNODB p50 (ms) | FALKORDB p50 (ms) | MEMGRAPH p50 (ms) | NEO4J p50 (ms) | ARCADEDB p95 (ms) | COGNODB p95 (ms) | FALKORDB p95 (ms) | MEMGRAPH p95 (ms) | NEO4J p95 (ms) |
+|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|:---|
+| `point` | **1.24 ms** | **303.87 ms** | **0.54 ms** | **0.49 ms** | **102.29 ms** | **1.89 ms** | **361.05 ms** | **0.65 ms** | **0.66 ms** | **153.30 ms** |
+| `traversal_1` | **2.79 ms** | **877.53 ms** | **0.63 ms** | **1.32 ms** | **204.74 ms** | **81.09 ms** | **1433.97 ms** | **0.78 ms** | **2.74 ms** | **255.76 ms** |
+| `traversal_2` | **2.78 ms** | **872.21 ms** | **0.74 ms** | **1.36 ms** | **206.61 ms** | **84.32 ms** | **1236.81 ms** | **2.92 ms** | **3.82 ms** | **296.32 ms** |
+| `traversal_3` | **2.40 ms** | **930.99 ms** | **2.34 ms** | **1.60 ms** | **204.94 ms** | **96.36 ms** | **2138.06 ms** | **58.85 ms** | **55.32 ms** | **259.49 ms** |
+| `aggregation` | **196.91 ms** | **1816.00 ms** | **400.35 ms** | **282.17 ms** | **256.37 ms** | **283.32 ms** | **2045.28 ms** | **664.80 ms** | **477.86 ms** | **318.96 ms** |
 <!-- BENCHMARK_RESULTS_END -->
 
 ---
@@ -98,14 +98,20 @@ chmod +x scripts/run_all.sh
 
 ## 🔬 Analysis & Engineering Insights
 
-1. **Schema Indexing Impact on Ingestion:**
-   Creating explicit range indexes on `:User(id)` prior to relationship linking reduced batch edge insertion times from $O(N)$ full graph scans down to $O(1)$ lookups per edge. This eliminated ingestion deadlocks across 289,003 relationship insertions.
+1. **In-Memory Engines vs. Disk/Network Latency**:
+   * **Memgraph** and **FalkorDB** set the baseline for raw operational speed across point lookups and shallow traversals, operating at **sub-millisecond p50 latencies** (`493 µs` and `540 µs` respectively).
+   * **Neo4j** and **CognoDB Cloud** demonstrate higher baseline latency floors (~100 ms to 300 ms for point lookups). Because these instances run over remote/cloud Bolt protocol connections, driver serialization, socket acquisition, and network round-trip time (RTT) account for the majority of the p50 overhead rather than query execution itself.
 
-2. **Hop Depth Scalability (1 to 3 Hops):**
-   The p50 latency remained tight between **182.97 ms** (3-hop) and **185.14 ms** (1-hop). Memory locality and query caching allow deeper graph traversals to execute without significant exponential degradation at small graph scales.
+2. **Traversal Hop Depth & Tail Latency (p95 Spikes)**:
+   * Across local engines (**ArcadeDB**, **Memgraph**, **FalkorDB**), p50 latency remains exceptionally tight as hop depth increases from 1 to 3 hops (e.g., Memgraph scales smoothly from **1.32 ms** to **1.60 ms**).
+   * However, tail latency (**p95**) reveals the exponential expansion of the search frontier on 3-hop traversals:
+     * **ArcadeDB**: Spikes from **1.89 ms** (point) to **96.36 ms** (3-hop p95).
+     * **Memgraph**: Jumps from **2.74 ms** (1-hop p95) to **55.32 ms** (3-hop p95).
+     * **FalkorDB**: Matrix multiplication via GraphBLAS keeps 2-hop p95 low (**2.92 ms**), but scales to **58.85 ms** at 3 hops when hitting high-degree hubs.
 
-3. **Aggregation Overhead:**
-   Degree aggregation queries (`MATCH (u:User)-[r]->() RETURN u.id, COUNT(r) ORDER BY degree DESC LIMIT 10`) represent the most expensive query pattern at **242.98 ms (p50)** and **292.66 ms (p95)** due to global pointer traversal and sort buffering.
+3. **Aggregation Overhead**:
+   * Global degree aggregations (`MATCH (u:User)-[r:MUTUAL_FOLLOW]->() RETURN u.id, COUNT(r) ORDER BY degree DESC LIMIT 10`) are uniformly the most expensive read operation across all platforms.
+   * **ArcadeDB** achieved the fastest aggregation p50 (**196.91 ms**), closely followed by **Neo4j** (**256.37 ms**) and **Memgraph** (**282.17 ms**), where global pointer traversals and heap sorting dominate execution time under 0.5 vCPU constraints.
 
 ---
 

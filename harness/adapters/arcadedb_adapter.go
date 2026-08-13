@@ -6,131 +6,241 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
 type ArcadeDBAdapter struct {
-	baseURL string
-	client  *http.Client
-	auth    string
+	client   *http.Client
+	baseURL  string
+	dbName   string
+	user     string
+	password string
+	ridMap   sync.Map // Map[string]string for id -> @rid mapping
 }
 
-func NewArcadeDBAdapter() *ArcadeDBAdapter { return &ArcadeDBAdapter{client: &http.Client{}} }
+func NewArcadeDBAdapter() *ArcadeDBAdapter {
+	return &ArcadeDBAdapter{
+		client: &http.Client{Timeout: 120 * time.Second},
+	}
+}
 
 func (a *ArcadeDBAdapter) Connect(ctx context.Context, uri, user, pass string) error {
-	a.baseURL = strings.TrimRight(uri, "/")
-	if user != "" && pass != "" {
-		a.auth = user + ":" + pass
+	if !strings.Contains(uri, "://") {
+		uri = "http://" + uri
 	}
-	// Try a simple GET to the base URL with a short timeout to validate connectivity.
-	pingCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	req, _ := http.NewRequestWithContext(pingCtx, http.MethodGet, a.baseURL, nil)
-	resp, err := a.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("arcadedb ping: %w", err)
-	}
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("arcadedb ping: status %d", resp.StatusCode)
-	}
-	return nil
-}
-
-func (a *ArcadeDBAdapter) doQuery(ctx context.Context, path string, payload any) error {
-	b, _ := json.Marshal(payload)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+path, bytes.NewReader(b))
-	req.Header.Set("Content-Type", "application/json")
-	if a.auth != "" {
-		parts := strings.SplitN(a.auth, ":", 2)
-		if len(parts) == 2 {
-			req.SetBasicAuth(parts[0], parts[1])
-		}
-	}
-	resp, err := a.client.Do(req)
+	u, err := url.Parse(uri)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	body, _ := ioutil.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return fmt.Errorf("arcadedb query: status %d body=%s", resp.StatusCode, string(body))
+
+	a.baseURL = fmt.Sprintf("%s://%s", u.Scheme, u.Host)
+	a.dbName = strings.Trim(u.Path, "/")
+	if a.dbName == "" {
+		a.dbName = "benchmark"
 	}
+	a.user = user
+	a.password = pass
+
+	// Ensure target database exists
+	createDBCmd := map[string]string{
+		"command": fmt.Sprintf("CREATE DATABASE %s", a.dbName),
+	}
+	body, _ := json.Marshal(createDBCmd)
+
+	req, err := http.NewRequestWithContext(ctx, "POST", a.baseURL+"/api/v1/server", bytes.NewBuffer(body))
+	if err == nil {
+		req.SetBasicAuth(a.user, a.password)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := a.client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}
+
+	// Schema initialization
+	// Schema initialization - Drop stale types from interrupted runs
+	_, _ = a.executeCommand(ctx, "DROP TYPE MUTUAL_FOLLOW UNSAFE IF EXISTS", "sql")
+	_, _ = a.executeCommand(ctx, "DROP TYPE User UNSAFE IF EXISTS", "sql")
+
+	// Re-create types & unique index
+	_, _ = a.executeCommand(ctx, "CREATE VERTEX TYPE User IF NOT EXISTS", "sql")
+	_, _ = a.executeCommand(ctx, "CREATE PROPERTY User.id IF NOT EXISTS STRING", "sql")
+	_, _ = a.executeCommand(ctx, "CREATE INDEX IF NOT EXISTS ON User (id) UNIQUE", "sql")
+	_, _ = a.executeCommand(ctx, "CREATE EDGE TYPE MUTUAL_FOLLOW IF NOT EXISTS", "sql")
 	return nil
 }
 
+func (a *ArcadeDBAdapter) Close(ctx context.Context) error {
+	return nil
+}
+
+func (a *ArcadeDBAdapter) executeCommand(ctx context.Context, statement string, lang string) ([]byte, error) {
+	payload := map[string]interface{}{
+		"language": lang,
+		"command":  statement,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v1/command/%s", a.baseURL, a.dbName)
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(body))
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(a.user, a.password)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("arcadedb status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return respBody, nil
+}
+
+func (a *ArcadeDBAdapter) executeQuery(ctx context.Context, statement string) ([]byte, error) {
+	payload := map[string]interface{}{
+		"language": "sql",
+		"command":  statement,
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint := fmt.Sprintf("%s/api/v1/query/%s", a.baseURL, a.dbName)
+	req, err := http.NewRequestWithContext(ctx, "POST", endpoint, bytes.NewBuffer(body))
+	if err != nil {
+		return nil, err
+	}
+	req.SetBasicAuth(a.user, a.password)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("arcadedb query status %d: %s", resp.StatusCode, string(respBody))
+	}
+	return respBody, nil
+}
+
 func (a *ArcadeDBAdapter) IngestBatch(ctx context.Context, nodes []Node, rels []Relationship) error {
-	// Chunk ingestion to avoid large command payloads.
-	const chunkSize = 200
+	const chunkSize = 500
+
+	// 1. Ingest Nodes
+	for i := 0; i < len(nodes); i += chunkSize {
+		end := i + chunkSize
+		if end > len(nodes) {
+			end = len(nodes)
+		}
+		batch := nodes[i:end]
+
+		var statements []string
+		for _, n := range batch {
+			stmt := fmt.Sprintf("CREATE VERTEX User SET id = '%s', location = '%s', public_repos = %d;",
+				escapeString(n.ID), escapeString(n.Location), n.PublicRepos)
+			statements = append(statements, stmt)
+		}
+
+		batchSQL := strings.Join(statements, "\n")
+		if _, err := a.executeCommand(ctx, batchSQL, "sqlscript"); err != nil {
+			return fmt.Errorf("arcade ingest nodes chunk: %w", err)
+		}
+	}
+
+	// 2. Fetch RIDs once if map is empty to populate id -> @rid in Go memory
 	if len(nodes) > 0 {
-		for i := 0; i < len(nodes); i += chunkSize {
-			end := i + chunkSize
-			if end > len(nodes) {
-				end = len(nodes)
+		q := "SELECT id, @rid FROM User"
+		respBytes, err := a.executeQuery(ctx, q)
+		if err == nil {
+			var queryRes struct {
+				Result []struct {
+					ID  string `json:"id"`
+					RID string `json:"@rid"`
+				} `json:"result"`
 			}
-			batch := nodes[i:end]
-			var cmds []string
-			for _, n := range batch {
-				cmds = append(cmds, fmt.Sprintf("CREATE VERTEX User SET id = '%s', location = '%s', public_repos = %d", escapeSQL(n.ID), escapeSQL(n.Location), n.PublicRepos))
-			}
-			payload := map[string]any{"language": "sql", "command": strings.Join(cmds, ";")}
-			if err := a.doQuery(ctx, "/command", payload); err != nil {
-				return fmt.Errorf("arcade ingest nodes chunk: %w", err)
+			if jsonErr := json.Unmarshal(respBytes, &queryRes); jsonErr == nil {
+				for _, row := range queryRes.Result {
+					a.ridMap.Store(row.ID, row.RID)
+				}
 			}
 		}
 	}
-	if len(rels) > 0 {
-		for i := 0; i < len(rels); i += chunkSize {
-			end := i + chunkSize
-			if end > len(rels) {
-				end = len(rels)
+
+	// 3. Ingest Relationships using fast direct @rid targets
+	for i := 0; i < len(rels); i += chunkSize {
+		end := i + chunkSize
+		if end > len(rels) {
+			end = len(rels)
+		}
+		batch := rels[i:end]
+
+		var statements []string
+		for _, r := range batch {
+			fromRID, ok1 := a.ridMap.Load(r.From)
+			toRID, ok2 := a.ridMap.Load(r.To)
+
+			if ok1 && ok2 {
+				stmt := fmt.Sprintf("CREATE EDGE MUTUAL_FOLLOW FROM %s TO %s;", fromRID, toRID)
+				statements = append(statements, stmt)
 			}
-			batch := rels[i:end]
-			var cmds []string
-			for _, r := range batch {
-				cmds = append(cmds, fmt.Sprintf("CREATE EDGE MUTUAL_FOLLOW FROM (SELECT FROM User WHERE id = '%s') TO (SELECT FROM User WHERE id = '%s')", escapeSQL(r.From), escapeSQL(r.To)))
-			}
-			payload := map[string]any{"language": "sql", "command": strings.Join(cmds, ";")}
-			if err := a.doQuery(ctx, "/command", payload); err != nil {
+		}
+
+		if len(statements) > 0 {
+			batchSQL := strings.Join(statements, "\n")
+			if _, err := a.executeCommand(ctx, batchSQL, "sqlscript"); err != nil {
 				return fmt.Errorf("arcade ingest rels chunk: %w", err)
 			}
 		}
 	}
+
 	return nil
 }
 
-// escapeSQL performs minimal escaping for single quotes and backslashes in SQL-style commands.
-func escapeSQL(s string) string {
-	if s == "" {
-		return s
-	}
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, "'", "\\'")
-	return s
-}
-
 func (a *ArcadeDBAdapter) PointLookup(ctx context.Context, id string) error {
-	payload := map[string]any{"language": "sql", "command": fmt.Sprintf("SELECT FROM User WHERE id = '%s' LIMIT 1", id)}
-	return a.doQuery(ctx, "/command", payload)
+	q := fmt.Sprintf("SELECT FROM User WHERE id = '%s'", escapeString(id))
+	_, err := a.executeQuery(ctx, q)
+	return err
 }
 
 func (a *ArcadeDBAdapter) Traversal(ctx context.Context, startID string, hops int) error {
-	payload := map[string]any{"language": "sql", "command": fmt.Sprintf("MATCH {class: User, as: u, where: (id = '%s')} .out('MUTUAL_FOLLOW'){maxDepth: %d} RETURN count(*)", startID, hops)}
-	return a.doQuery(ctx, "/command", payload)
+	q := fmt.Sprintf("SELECT count(*) FROM (TRAVERSE out('MUTUAL_FOLLOW') FROM (SELECT FROM User WHERE id = '%s') WHILE $depth <= %d)", escapeString(startID), hops)
+	_, err := a.executeQuery(ctx, q)
+	return err
 }
 
 func (a *ArcadeDBAdapter) Aggregation(ctx context.Context) error {
-	payload := map[string]any{"language": "sql", "command": "SELECT id, out('MUTUAL_FOLLOW').size() as degree FROM User ORDER BY degree DESC LIMIT 10"}
-	return a.doQuery(ctx, "/command", payload)
+	q := "SELECT id, out('MUTUAL_FOLLOW').size() AS degree FROM User ORDER BY degree DESC LIMIT 10"
+	_, err := a.executeQuery(ctx, q)
+	return err
 }
 
-func (a *ArcadeDBAdapter) ExecuteWrite(ctx context.Context, cypher string, params map[string]interface{}) error {
-	payload := map[string]any{"language": "sql", "command": cypher}
-	return a.doQuery(ctx, "/command", payload)
+func (a *ArcadeDBAdapter) ExecuteWrite(ctx context.Context, query string, params map[string]interface{}) error {
+	_, err := a.executeCommand(ctx, query, "sql")
+	return err
 }
 
-func (a *ArcadeDBAdapter) Close(ctx context.Context) error { return nil }
+func (a *ArcadeDBAdapter) ExecuteRead(ctx context.Context, query string, params map[string]interface{}) error {
+	_, err := a.executeQuery(ctx, query)
+	return err
+}
+
+func escapeString(s string) string {
+	return strings.ReplaceAll(s, "'", "\\'")
+}

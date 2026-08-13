@@ -8,21 +8,33 @@ START_MARKER = "<!-- BENCHMARK_RESULTS_START -->"
 END_MARKER = "<!-- BENCHMARK_RESULTS_END -->"
 
 def generate_markdown_table(data):
+    # Filter out top-level invalid keys (e.g. orphan "point", "aggregation" null maps)
+    platforms = [k for k, v in data.items() if isinstance(v, dict) and any(isinstance(sub, dict) for sub in v.values())]
+    workloads = ["point", "traversal_1", "traversal_2", "traversal_3", "aggregation"]
+
+    headers = ["Workload"] + [f"{p.upper()} p50 (ms)" for p in platforms] + [f"{p.upper()} p95 (ms)" for p in platforms]
     lines = [
-        "| Workload | p50 Latency (ms) | p95 Latency (ms) | p50 (µs) | p95 (µs) |",
-        "| :--- | :--- | :--- | :--- | :--- |"
+        "| " + " | ".join(headers) + " |",
+        "|" + "|".join([":---"] * len(headers)) + "|"
     ]
-    for q, metrics in data.items():
-        p50_us = metrics.get("p50_us", 0)
-        p95_us = metrics.get("p95_us", 0)
-        p50_ms = p50_us / 1000.0
-        p95_ms = p95_us / 1000.0
-        lines.append(f"| `{q}` | **{p50_ms:.2f} ms** | **{p95_ms:.2f} ms** | {p50_us:,} µs | {p95_us:,} µs |")
+
+    for w in workloads:
+        row = [f"`{w}`"]
+        # Add p50s
+        for p in platforms:
+            val = data[p].get(w, {}).get("p50_us", 0) / 1000.0 if isinstance(data[p].get(w), dict) else 0
+            row.append(f"**{val:.2f} ms**" if val > 0 else "N/A")
+        # Add p95s
+        for p in platforms:
+            val = data[p].get(w, {}).get("p95_us", 0) / 1000.0 if isinstance(data[p].get(w), dict) else 0
+            row.append(f"**{val:.2f} ms**" if val > 0 else "N/A")
+
+        lines.append("| " + " | ".join(row) + " |")
+
     return "\n".join(lines)
 
 def main():
     if not os.path.exists(RESULTS_FILE):
-        print(f"Skipping report generation: {RESULTS_FILE} not found.")
         return
 
     with open(RESULTS_FILE, "r") as f:
@@ -31,24 +43,16 @@ def main():
     table_md = generate_markdown_table(data)
     block = f"{START_MARKER}\n{table_md}\n{END_MARKER}"
 
-    if not os.path.exists(README_FILE):
-        readme_content = f"# CognoDB Benchmark Report\n\n## Latest Execution Results\n\n{block}\n"
-    else:
+    if os.path.exists(README_FILE):
         with open(README_FILE, "r") as f:
-            readme_content = f.read()
+            content = f.read()
 
-        # If comment markers exist in README.md, replace between them
-        if START_MARKER in readme_content and END_MARKER in readme_content:
+        if START_MARKER in content and END_MARKER in content:
             pattern = re.compile(f"{re.escape(START_MARKER)}.*?{re.escape(END_MARKER)}", re.DOTALL)
-            readme_content = pattern.sub(block, readme_content)
-        else:
-            # Otherwise, append a new section at the bottom
-            readme_content = readme_content.rstrip() + f"\n\n## Latest Benchmark Results\n\n{block}\n"
-
-    with open(README_FILE, "w") as f:
-        f.write(readme_content)
-
-    print(f"Successfully updated {README_FILE} with benchmark results!")
+            content = pattern.sub(block, content)
+            with open(README_FILE, "w") as f:
+                f.write(content)
+            print("Successfully updated README.md with comparative matrix!")
 
 if __name__ == "__main__":
     main()

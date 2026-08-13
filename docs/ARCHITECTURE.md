@@ -87,6 +87,13 @@ type GraphDBAdapter interface {
 * **`FalkorDBAdapter` (`falkordb_adapter.go`):** Connects to RedisGraph/FalkorDB endpoints over `go-redis/v9` using pipelined Cypher queries via `GRAPH.QUERY` commands.
 * **`ArcadeDBAdapter` (`arcadedb_adapter.go`):** Uses an HTTP REST transport sending batched SQL/Cypher command payloads with HTTP Basic Authentication.
 
+### Ingestion Stability & Transaction Chunking (`BoltAdapter`)
+
+To handle large graph imports over remote or cloud-hosted Bolt instances (e.g., Neo4j Aura / Cloud targets) without encountering protocol drops or timeout errors:
+
+* **Sub-Batch Transaction Chunking**: Relationship ingest queries (`UNWIND $batch AS r MATCH (a:User {id: r.from}), (b:User {id: r.to}) MERGE ...`) are automatically split into sub-transactions of 1,000 entities per `ExecuteWrite` call. This prevents single write operations from holding locks beyond the standard 60-second cloud connection deadline.
+* **Driver Timeout Management**: The Go Bolt driver configuration explicitly tunes connection pool acquisition via `ConnectionAcquisitionTimeout` and applies per-transaction timeout bounds (`neo4j.WithTxTimeout`) to ensure deterministic failure recovery and prevent hung worker routines during stress runs.
+
 ---
 
 ### 2. `harness/workload/` — Execution Engine & Sampling
@@ -106,6 +113,12 @@ type GraphDBAdapter interface {
 * **`histogram.go`:** Thread-safe, low-overhead latency recorder.
 * Stores observed durations in microsecond slices (`int64`) protected by a `sync.Mutex`.
 * Quantile calculation (`ValueAtQuantile`) sorts duration samples and computes p50 and p95 percentiles without external heavy sampling dependencies.
+
+### 4. `scripts/` — Reporting & JSON Output Sanitization
+
+* **`generate_report.py` & `plot_results.py`**:
+  * Parse execution metrics from `results/results.json`.
+  * **Key Sanitization**: To guard against malformed JSON or orphan top-level benchmark keys (e.g., null aggregation objects), reporting scripts strictly validate that each top-level key contains a valid nested dictionary before converting microsecond integer metrics (`p50_us`, `p95_us`) to millisecond float values (`ms`) for table injection and Matplotlib rendering.
 
 ---
 
